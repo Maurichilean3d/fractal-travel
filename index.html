@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+// Ajuste dinámico de resolución según fps (no se aplica <!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="UTF-8" />
@@ -114,11 +114,18 @@ import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-let renderer, scene, camera, controls, clock, quad, material;
+let renderer, scene, camera, camRig, controls, clock, quad, material;
 let autoTravel = true, paused = false, autoPerf = true;
 
 let growAmt = 0.40, speed = 0.6, detail = 0.46, hue = 0.62 * 6.283;
-let flyDist = 2.6, simTime = 0, figure = 0;
+let simTime = 0, figure = 0;
+
+// El fractal está FIJO en este punto del mundo. Nunca persigue la mirada.
+const FRACTAL_CENTER = new THREE.Vector3(0, 1.6, -3.0);
+// Distancia real de la cámara al fractal. Viajar = cambiar esta distancia.
+let travelDist = 3.2;
+const TRAVEL_MIN = 1.05, TRAVEL_MAX = 7.0;
+
 const keyboard = new Set();
 const controllers = [];
 
@@ -256,12 +263,34 @@ const fragmentShader = /* glsl */`
     return 0.5 + 0.5*cos(6.28318*(vec3(1.0)*t + vec3(0.0,0.33,0.67) + uHue));
   }
 
+  // Intersección rayo-esfera: t de entrada/salida. Devuelve false si no toca.
+  bool hitBounds(vec3 ro, vec3 rd, vec3 ce, float ra, out float tN, out float tF){
+    vec3 oc = ro - ce;
+    float b = dot(oc, rd);
+    float c = dot(oc, oc) - ra*ra;
+    float h = b*b - c;
+    if(h < 0.0) return false;
+    h = sqrt(h);
+    tN = -b - h; tF = -b + h;
+    return tF > 0.0;
+  }
+
   // Raymarching + sombreado. 'fove' (0..1) modula los pasos: 1 en el foco,
   // menos hacia el borde del cono -> foveated rendering barato.
   void marchAndShade(vec3 ro, vec3 rd, float fove, vec3 voidCol){
-    float t = 0.0, trap = 0.0, glow = 0.0;
+    // Esfera limitadora alrededor del fractal: saltamos el vacío y arrancamos
+    // el rayo justo en su entrada -> ahorro enorme de pasos cuando estás lejos.
+    float tN, tF;
+    float bound = uFly*1.6 + 0.4;
+    if(!hitBounds(ro, rd, uCenter, bound, tN, tF)){
+      gl_FragColor = vec4(voidCol, 1.0);
+      return;
+    }
+    float t = max(tN, 0.0);
+    float tEnd = min(tF, MAX_DIST);
+
+    float trap = 0.0, glow = 0.0;
     bool hit = false;
-    // Pasos plenos en el centro; hasta ~45% menos en el borde del cono.
     int steps = int((48.0 + uDetail*40.0) * (0.55 + 0.45*fove));
 
     for(int i=0;i<MAX_STEPS;i++){
@@ -273,7 +302,7 @@ const fragmentShader = /* glsl */`
       float eps = 0.0006 + t*0.0012;
       if(d < eps){ hit = true; trap = tr; break; }
       t += d*0.9;
-      if(t > MAX_DIST) break;
+      if(t > tEnd) break;
     }
 
     vec3 col;
@@ -336,7 +365,13 @@ function init(){
   scene = new THREE.Scene();
 
   camera = new THREE.PerspectiveCamera(72, innerWidth/innerHeight, 0.01, 100);
-  camera.position.set(0, 1.6, 0);
+
+  // Rig: contenedor de la cámara. El VIAJE mueve el rig hacia el fractal,
+  // no el fractal hacia la cámara. Así en VR el objeto queda FIJO en el
+  // espacio y mover la cabeza solo cambia tu punto de vista (como debe ser).
+  camRig = new THREE.Group();
+  camRig.add(camera);
+  scene.add(camRig);
 
   renderer = new THREE.WebGLRenderer({ antialias:false, powerPreference:'high-performance' });
   curRatio = Math.min(devicePixelRatio, 1.3);
@@ -349,8 +384,8 @@ function init(){
   material = new THREE.ShaderMaterial({
     uniforms: {
       uTime:{value:0}, uPower:{value:8}, uDetail:{value:detail},
-      uHue:{value:hue}, uGrow:{value:growAmt}, uFly:{value:flyDist},
-      uFigure:{value:0}, uCenter:{value:new THREE.Vector3(0,1.6,-2.4)},
+      uHue:{value:hue}, uGrow:{value:growAmt}, uFly:{value:1.0},
+      uFigure:{value:0}, uCenter:{value:FRACTAL_CENTER.clone()},
       uForward:{value:new THREE.Vector3(0,0,-1)},
       uConeCos:{value:Math.cos(THREE.MathUtils.degToRad(55))},
       uConeOn:{value:1}
@@ -359,18 +394,22 @@ function init(){
     side: THREE.BackSide, depthWrite:false, depthTest:false
   });
 
+  // Domo envolvente, hijo de la cámara: cubre todo el FOV por ojo (estéreo OK).
   quad = new THREE.Mesh(new THREE.SphereGeometry(20, 24, 12), material);
   quad.frustumCulled = false;
   camera.add(quad);
-  scene.add(camera);
 
+  // Posición inicial del rig: a 'travelDist' del fractal, mirándolo.
+  positionRig();
+
+  // OrbitControls SOLO en escritorio: orbita alrededor del fractal fijo.
   controls = new OrbitControls(camera, renderer.domElement);
-  controls.target.set(0,1.6,-2.4);
+  controls.target.copy(FRACTAL_CENTER);
   controls.enableDamping = true;
   controls.dampingFactor = 0.06;
   controls.enablePan = false;
   controls.enableZoom = false;
-  controls.minDistance = 2.4; controls.maxDistance = 2.4;
+  controls.minDistance = travelDist; controls.maxDistance = travelDist;
 
   renderer.xr.addEventListener('sessionstart', ()=>{
     document.body.classList.add('xr-active');
@@ -390,7 +429,15 @@ function init(){
   addEventListener('resize', onResize);
   addEventListener('keydown', e=>{ keyboard.add(e.code); if(['KeyW','KeyS'].includes(e.code)){ autoTravel=false; syncAuto(); } });
   addEventListener('keyup', e=>keyboard.delete(e.code));
-  addEventListener('wheel', e=>{ flyDist = Math.max(0.45, Math.min(6.0, flyDist*(1+Math.sign(e.deltaY)*0.05))); autoTravel=false; syncAuto(); }, {passive:true});
+  addEventListener('wheel', e=>{ travelDist = Math.max(TRAVEL_MIN, Math.min(TRAVEL_MAX, travelDist*(1+Math.sign(e.deltaY)*0.05))); autoTravel=false; syncAuto(); }, {passive:true});
+}
+
+// Coloca el rig a 'travelDist' del fractal, sobre el eje Z, mirándolo.
+// En VR no tocamos la orientación de la cámara (la maneja el visor);
+// solo movemos el rig en el espacio, así el objeto se queda fijo.
+function positionRig(){
+  if(!camRig) return;
+  camRig.position.set(FRACTAL_CENTER.x, FRACTAL_CENTER.y, FRACTAL_CENTER.z + travelDist);
 }
 
 function setupControllers(){
@@ -453,37 +500,54 @@ function render(){
   const dt = Math.min(clock.getDelta(), 0.05);
   if(!paused) simTime += dt;
 
+  // Auto-viaje: oscila la DISTANCIA al fractal (acercarse / alejarse).
   if(autoTravel && !paused){
-    flyDist = Math.max(0.65, 1.7 + 1.05*Math.sin(simTime*0.13*speed));
+    travelDist = TRAVEL_MIN + (TRAVEL_MAX-TRAVEL_MIN)*0.5*(1.05 + Math.sin(simTime*0.13*speed))*0.5;
+    travelDist = Math.min(TRAVEL_MAX, Math.max(TRAVEL_MIN, travelDist));
   }
-  const ks = dt*1.1*speed;
-  if(keyboard.has('KeyW')) flyDist = Math.max(0.45, flyDist-ks);
-  if(keyboard.has('KeyS')) flyDist = Math.min(6.0, flyDist+ks);
+  const ks = dt*1.4*speed;
+  if(keyboard.has('KeyW')) travelDist = Math.max(TRAVEL_MIN, travelDist-ks);
+  if(keyboard.has('KeyS')) travelDist = Math.min(TRAVEL_MAX, travelDist+ks);
 
   if(renderer.xr.isPresenting){
     for(const c of controllers){
       const src = c.userData.inputSource;
       if(src && src.gamepad){
         const trig = src.gamepad.buttons[0]?.value || 0;
-        if(trig > 0.1) flyDist = Math.max(0.45, flyDist - dt*1.6*speed*trig);
+        if(trig > 0.1) travelDist = Math.max(TRAVEL_MIN, travelDist - dt*1.8*speed*trig);
       }
-      if(c.userData.reverse) flyDist = Math.min(6.0, flyDist + dt*1.6*speed);
+      if(c.userData.reverse) travelDist = Math.min(TRAVEL_MAX, travelDist + dt*1.8*speed);
     }
   }
 
   material.uniforms.uTime.value = simTime;
   material.uniforms.uPower.value = 8.0 + Math.sin(simTime*0.25)*1.5*growAmt;
-  material.uniforms.uFly.value = flyDist;
 
-  const camWorld = new THREE.Vector3(), camDir = new THREE.Vector3();
+  // La escala del fractal en el shader crece al acercarte -> más detalle visible.
+  // (distancia pequeña => uFly pequeño => el fractal "ocupa" más campo).
+  const uFly = THREE.MathUtils.clamp(travelDist*0.42, 0.4, 3.2);
+  material.uniforms.uFly.value = uFly;
+
+  // El fractal está FIJO: el uniform uCenter no cambia con la mirada.
+  // (se quedó en FRACTAL_CENTER desde init).
+
+  if(renderer.xr.isPresenting){
+    // En VR movemos el rig acercándolo/alejándolo del fractal en su eje,
+    // sin tocar la orientación de la cámara (la controla el visor).
+    positionRig();
+  } else {
+    // En escritorio, OrbitControls orbita la cámara alrededor del fractal fijo.
+    controls.minDistance = controls.maxDistance = travelDist;
+    controls.update();
+  }
+
+  // Eje del cono = dirección de la cámara HACIA el fractal (enmarca el objeto,
+  // no la cabeza). Así girar la vista no arrastra el recorte de forma rara.
+  const camWorld = new THREE.Vector3();
   camera.getWorldPosition(camWorld);
-  camera.getWorldDirection(camDir);
-  material.uniforms.uCenter.value.copy(camWorld).addScaledVector(camDir, 2.4);
-  material.uniforms.uForward.value.copy(camDir);   // eje del cono = mirada
+  material.uniforms.uForward.value.copy(FRACTAL_CENTER).sub(camWorld).normalize();
 
-  if(!renderer.xr.isPresenting) controls.update();
   updateAdaptiveRes(dt);
-
   renderer.render(scene, camera);
 
   const s = document.getElementById('stat');
@@ -499,4 +563,4 @@ renderer.xr.addEventListener('sessionstart', ()=>{
 });
 </script>
 </body>
-</html>
+</html> de XR: el visor manda).
