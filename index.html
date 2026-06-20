@@ -3,14 +3,14 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Viaje Fractal VR — Mandelbulb Vivo</title>
+<title>Viaje Fractal VR — Multiverso</title>
 <style>
   :root { color-scheme: dark; }
   html,body { margin:0; width:100%; height:100%; overflow:hidden; background:#000; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
   canvas { display:block; }
   #hud {
     position:fixed; left:16px; top:16px; z-index:5;
-    width:min(320px, calc(100vw - 32px));
+    width:min(330px, calc(100vw - 32px));
     padding:14px 16px;
     color:#dfe9ff;
     background:linear-gradient(150deg, rgba(10,8,26,.86), rgba(8,6,18,.5));
@@ -26,9 +26,10 @@
   .ctrl label { display:flex; justify-content:space-between; font-size:11px; letter-spacing:.3px; color:rgba(214,224,255,.85); margin-bottom:5px; }
   .ctrl label span { color:#b9a8ff; font-variant-numeric:tabular-nums; }
   input[type=range] { width:100%; accent-color:#9a7bff; height:4px; }
+  .figs { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin:6px 0 4px; }
+  .figs button { font-size:11px; padding:7px 6px; }
   .row { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
   button {
-    flex:1; min-width:84px;
     appearance:none; cursor:pointer;
     border:1px solid rgba(150,130,255,.3);
     border-radius:999px;
@@ -36,24 +37,20 @@
     color:#ede8ff; font-family:inherit; font-size:12px; font-weight:700;
     padding:8px 10px;
   }
+  .row button { flex:1; min-width:84px; }
   button:hover { background:rgba(120,95,240,.34); }
   button.active { background:rgba(150,120,255,.5); border-color:rgba(190,170,255,.6); }
   #keys { margin-top:12px; font-size:10px; line-height:1.5; color:rgba(190,200,235,.5); }
   #keys b { color:rgba(214,224,255,.78); font-weight:600; }
   body.xr-active #hud { display:none; }
-
-  /* Botón VR de Three.js: lo dejamos abajo centrado y visible */
-  #VRButton {
-    z-index: 6 !important;
-  }
-  #depth {
+  #stat {
     position:fixed; right:16px; bottom:16px; z-index:5;
     font-size:11px; color:rgba(200,210,255,.7);
     background:rgba(10,8,26,.6); border:1px solid rgba(150,130,255,.2);
     border-radius:10px; padding:7px 11px; backdrop-filter:blur(8px);
-    font-variant-numeric:tabular-nums;
+    font-variant-numeric:tabular-nums; text-align:right; line-height:1.5;
   }
-  body.xr-active #depth { display:none; }
+  body.xr-active #stat { display:none; }
 </style>
 <script type="importmap">
 {
@@ -66,8 +63,15 @@
 </head>
 <body>
 <div id="hud">
-  <h1>VIAJE FRACTAL VR</h1>
-  <p class="sub">Mandelbulb vivo por raymarching. Pulsa “Enter VR” en Quest, o vuela en escritorio.</p>
+  <h1>VIAJE FRACTAL · MULTIVERSO</h1>
+  <p class="sub">Raymarching optimizado con resolución adaptativa. Elige una figura y sumérgete.</p>
+
+  <div class="figs" id="figs">
+    <button data-fig="0" class="active">Mandelbulb</button>
+    <button data-fig="1">Mandelbox</button>
+    <button data-fig="2">Menger</button>
+    <button data-fig="3">Fibonacci</button>
+  </div>
 
   <div class="ctrl">
     <label>Desarrollo <span id="vGrow">suave</span></label>
@@ -78,7 +82,7 @@
     <input id="speed" type="range" min="0" max="100" value="35">
   </div>
   <div class="ctrl">
-    <label>Detalle / iteraciones <span id="vDetail">media</span></label>
+    <label>Detalle <span id="vDetail">media</span></label>
     <input id="detail" type="range" min="0" max="100" value="46">
   </div>
   <div class="ctrl">
@@ -89,15 +93,16 @@
   <div class="row">
     <button id="autoBtn" class="active">Auto-viaje</button>
     <button id="pauseBtn">Pausar</button>
+    <button id="perfBtn" class="active">Auto-calidad</button>
   </div>
 
   <div id="keys">
-    <b>Escritorio:</b> arrastra para mirar · rueda y W/S para avanzar<br>
-    <b>VR:</b> gatillo = auto-viaje on/off · stick/empuje = avanzar
+    <b>Escritorio:</b> arrastra para mirar · rueda y W/S avanzan<br>
+    <b>VR:</b> gatillo = avanzar · squeeze = retroceder
   </div>
 </div>
 
-<div id="depth">profundidad —</div>
+<div id="stat">fps —<br>res —</div>
 
 <script type="module">
 import * as THREE from 'three';
@@ -105,109 +110,162 @@ import { VRButton } from 'three/addons/webxr/VRButton.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 let renderer, scene, camera, controls, clock, quad, material;
-let autoTravel = true, paused = false;
+let autoTravel = true, paused = false, autoPerf = true;
 
 let growAmt = 0.40, speed = 0.6, detail = 0.46, hue = 0.62 * 6.283;
-// "flyOffset" desplaza el espacio del fractal: así viajamos hacia su interior.
-let flyDist = 2.6;            // distancia de inmersión (más pequeño = más dentro)
-let simTime = 0;
+let flyDist = 2.6, simTime = 0, figure = 0;
 const keyboard = new Set();
 const controllers = [];
 
+// --- resolución adaptativa ---
+let curRatio = 1.2;
+const MIN_RATIO = 0.6, MAX_RATIO = 1.6;
+let fpsAccum = 0, fpsFrames = 0, fpsValue = 60, ratioCooldown = 0;
+
 const vertexShader = /* glsl */`
-  varying vec3 vWorldDir;
-  varying vec3 vCamPos;
+  varying vec3 vDir;
   void main(){
-    // Reconstruir el rayo del mundo por ojo desde las matrices de la cámara.
-    vec4 worldPos = modelMatrix * vec4(position, 1.0);
-    vCamPos = cameraPosition;
-    vWorldDir = worldPos.xyz - cameraPosition;
+    vec4 wp = modelMatrix * vec4(position, 1.0);
+    vDir = wp.xyz - cameraPosition;
     gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
   }
 `;
 
+// Un único shader con switch de figura por #define en runtime (uniform int).
+// Cada DE (distance estimator) está optimizado; el bucle de marcha es compartido.
 const fragmentShader = /* glsl */`
   precision highp float;
-  varying vec3 vWorldDir;
-  varying vec3 vCamPos;
+  varying vec3 vDir;
 
-  uniform float uTime;
-  uniform float uPower;
-  uniform float uDetail;
-  uniform float uHue;
-  uniform float uGrow;
-  uniform float uFly;       // escala de inmersión
-  uniform vec3  uCenter;    // centro del fractal en el mundo
+  uniform float uTime, uPower, uDetail, uHue, uGrow, uFly;
+  uniform int   uFigure;
+  uniform vec3  uCenter;
 
-  #define MAX_STEPS 140
-  #define MAX_DIST  14.0
-  #define SURF      0.00045
+  #define MAX_STEPS 96
+  #define MAX_DIST  12.0
 
-  float mandelbulb(vec3 pos, out float trap){
-    vec3 z = pos;
-    float dr = 1.0;
-    float r = 0.0;
-    trap = 1e10;
-    int iters = int(6.0 + uDetail * 8.0);
-    for(int i=0;i<14;i++){
-      if(i>=iters) break;
+  // ---------- DE 0: Mandelbulb ----------
+  float deBulb(vec3 p, out float trap){
+    vec3 z = p; float dr = 1.0, r = 0.0; trap = 1e10;
+    int it = int(5.0 + uDetail*6.0);
+    for(int i=0;i<11;i++){
+      if(i>=it) break;
       r = length(z);
-      if(r > 2.0) break;
-      float theta = acos(z.z / r);
-      float phi   = atan(z.y, z.x);
-      dr = pow(r, uPower-1.0)*uPower*dr + 1.0;
-      float zr = pow(r, uPower);
-      theta *= uPower;
-      phi   *= uPower;
-      z = zr * vec3(sin(theta)*cos(phi), sin(theta)*sin(phi), cos(theta));
-      z += pos;
+      if(r>2.0) break;
+      float th = acos(z.z/r), ph = atan(z.y,z.x);
+      dr = pow(r,uPower-1.0)*uPower*dr + 1.0;
+      float zr = pow(r,uPower); th*=uPower; ph*=uPower;
+      z = zr*vec3(sin(th)*cos(ph), sin(th)*sin(ph), cos(th)) + p;
       trap = min(trap, r);
     }
-    return 0.5 * log(r) * r / dr;
+    return 0.5*log(r)*r/dr;
   }
 
-  float map(vec3 p, out float trap){
-    // Llevar el punto del mundo al espacio local del fractal.
-    vec3 q = (p - uCenter) / uFly;
-    return mandelbulb(q, trap) * uFly;
+  // ---------- DE 1: Mandelbox (cajas) ----------
+  float deBox(vec3 p, out float trap){
+    vec3 z = p; float dr = 1.0; trap = 1e10;
+    float scale = 2.4 + sin(uTime*0.2)*0.25*uGrow;
+    int it = int(7.0 + uDetail*7.0);
+    for(int i=0;i<14;i++){
+      if(i>=it) break;
+      // plegado de caja
+      z = clamp(z, -1.0, 1.0)*2.0 - z;
+      float r2 = dot(z,z);
+      // plegado esférico
+      if(r2 < 0.25){ float t=4.0; z*=t; dr*=t; }
+      else if(r2 < 1.0){ float t=1.0/r2; z*=t; dr*=t; }
+      z = scale*z + p; dr = dr*abs(scale) + 1.0;
+      trap = min(trap, r2);
+    }
+    return length(z)/abs(dr);
   }
 
+  // ---------- DE 2: Menger Sponge (cubos recursivos) ----------
+  float sdBoxd(vec3 p, vec3 b){ vec3 d=abs(p)-b; return length(max(d,0.0))+min(max(d.x,max(d.y,d.z)),0.0); }
+  float deMenger(vec3 p, out float trap){
+    float d = sdBoxd(p, vec3(1.0));
+    trap = d;
+    float s = 1.0;
+    int it = int(3.0 + uDetail*3.0);
+    for(int m=0;m<6;m++){
+      if(m>=it) break;
+      vec3 a = mod(p*s, 2.0) - 1.0;
+      s *= 3.0;
+      vec3 r = abs(1.0 - 3.0*abs(a));
+      float da = max(r.x, r.y);
+      float db = max(r.y, r.z);
+      float dc = max(r.z, r.x);
+      float c = (min(da, min(db, dc)) - 1.0)/s;
+      d = max(d, c);
+      trap = min(trap, d);
+    }
+    return d;
+  }
+
+  // ---------- DE 3: Orgánico Fibonacci (espiral áurea) ----------
+  // Esferas distribuidas en el ángulo dorado formando una concha/girasol.
+  float deFibo(vec3 p, out float trap){
+    float ga = 2.39996323;          // ángulo áureo
+    float d = 1e10; trap = 1e10;
+    float n = 22.0 + uDetail*30.0;
+    float grow = 1.0 + 0.15*sin(uTime*0.3)*uGrow;
+    for(int i=0;i<60;i++){
+      if(float(i) >= n) break;
+      float fi = float(i);
+      float t = fi/n;
+      float radius = pow(t, 0.5) * 1.6 * grow;       // crecimiento radial
+      float ang = fi * ga + uTime*0.1;
+      float y = (t*2.0 - 1.0) * 1.2;
+      vec3 c = vec3(cos(ang)*radius, y, sin(ang)*radius);
+      float sph = length(p - c) - (0.05 + 0.14*(1.0-t));
+      d = min(d, sph);
+      trap = min(trap, length(p-c));
+    }
+    return d*0.6;
+  }
+
+  float map(vec3 wp, out float trap){
+    vec3 p = (wp - uCenter)/uFly;
+    float d;
+    if(uFigure==0) d = deBulb(p, trap);
+    else if(uFigure==1) d = deBox(p, trap);
+    else if(uFigure==2) d = deMenger(p, trap);
+    else d = deFibo(p, trap);
+    return d*uFly;
+  }
+
+  // Normal por tetraedro: 4 muestras en vez de 6 (más barato, misma calidad).
   vec3 calcNormal(vec3 p){
-    vec2 e = vec2(0.0012, 0.0);
-    float t;
-    return normalize(vec3(
-      map(p+e.xyy,t)-map(p-e.xyy,t),
-      map(p+e.yxy,t)-map(p-e.yxy,t),
-      map(p+e.yyx,t)-map(p-e.yyx,t)
-    ));
+    const vec2 k = vec2(1.0, -1.0);
+    float h = 0.0012; float t;
+    return normalize(
+      k.xyy*map(p+k.xyy*h,t) + k.yyx*map(p+k.yyx*h,t) +
+      k.yxy*map(p+k.yxy*h,t) + k.xxx*map(p+k.xxx*h,t)
+    );
   }
 
   vec3 palette(float t){
-    vec3 a = vec3(0.5);
-    vec3 b = vec3(0.5);
-    vec3 c = vec3(1.0);
-    vec3 d = vec3(0.0, 0.33, 0.67) + uHue;
-    return a + b*cos(6.28318*(c*t + d));
+    return 0.5 + 0.5*cos(6.28318*(vec3(1.0)*t + vec3(0.0,0.33,0.67) + uHue));
   }
 
   void main(){
-    vec3 ro = vCamPos;
-    vec3 rd = normalize(vWorldDir);
+    vec3 ro = cameraPosition;
+    vec3 rd = normalize(vDir);
 
-    float t = 0.0;
-    float trap = 0.0;
-    float glow = 0.0;
+    float t = 0.0, trap = 0.0, glow = 0.0;
     bool hit = false;
-    int steps = int(70.0 + uDetail*70.0);
+    int steps = int(48.0 + uDetail*40.0);   // menos pasos base; sube con detalle
 
     for(int i=0;i<MAX_STEPS;i++){
       if(i>=steps) break;
       vec3 p = ro + rd*t;
       float tr;
       float d = map(p, tr);
-      glow += 0.013 / (1.0 + d*d*150.0);
-      if(d < SURF*(1.0 + t*0.4)){ hit = true; trap = tr; break; }
-      t += d*0.82;
+      glow += 0.012 / (1.0 + d*d*160.0);
+      // Umbral adaptativo: tolerancia crece con la distancia -> termina antes lejos
+      float eps = 0.0006 + t*0.0012;
+      if(d < eps){ hit = true; trap = tr; break; }
+      t += d*0.9;
       if(t > MAX_DIST) break;
     }
 
@@ -215,23 +273,19 @@ const fragmentShader = /* glsl */`
     if(hit){
       vec3 p = ro + rd*t;
       vec3 n = calcNormal(p);
-      vec3 lightDir = normalize(vec3(0.6, 0.7, 0.4));
-      float diff = clamp(dot(n, lightDir), 0.0, 1.0);
-      float amb  = 0.35 + 0.65*n.y;
-      float ao = 1.0 / (1.0 + t*0.3);
-      vec3 base  = palette(trap*1.6 + uTime*0.02);
-      vec3 base2 = palette(trap*2.4 + 0.4);
-      base = mix(base, base2, 0.4);
-      col = base * (0.25 + diff*0.9) * (0.5 + amb*0.5) * ao;
-      vec3 h = normalize(lightDir - rd);
-      col += vec3(1.0,0.95,0.9) * pow(clamp(dot(n,h),0.0,1.0), 28.0) * 0.4;
-      col = mix(col, vec3(0.02,0.01,0.05), clamp(t/MAX_DIST, 0.0, 1.0)*0.55);
+      vec3 L = normalize(vec3(0.6,0.7,0.4));
+      float diff = clamp(dot(n,L),0.0,1.0);
+      float amb = 0.35 + 0.65*n.y;
+      float ao = 1.0/(1.0 + t*0.3);
+      vec3 base = mix(palette(trap*1.6 + uTime*0.02), palette(trap*2.4+0.4), 0.4);
+      col = base*(0.25 + diff*0.9)*(0.5 + amb*0.5)*ao;
+      vec3 hh = normalize(L - rd);
+      col += vec3(1.0,0.95,0.9)*pow(clamp(dot(n,hh),0.0,1.0),28.0)*0.4;
+      col = mix(col, vec3(0.02,0.01,0.05), clamp(t/MAX_DIST,0.0,1.0)*0.55);
     } else {
-      col = vec3(0.012, 0.008, 0.03);
+      col = vec3(0.012,0.008,0.03);
     }
-
-    vec3 glowCol = palette(uHue + 0.15 + glow*0.3);
-    col += glowCol * glow * (0.55 + uGrow*0.5);
+    col += palette(uHue+0.15+glow*0.3)*glow*(0.55 + uGrow*0.5);
     col = pow(col, vec3(0.85));
     gl_FragColor = vec4(col, 1.0);
   }
@@ -248,7 +302,8 @@ function init(){
   camera.position.set(0, 1.6, 0);
 
   renderer = new THREE.WebGLRenderer({ antialias:false, powerPreference:'high-performance' });
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+  curRatio = Math.min(devicePixelRatio, 1.3);
+  renderer.setPixelRatio(curRatio);
   renderer.setSize(innerWidth, innerHeight);
   renderer.xr.enabled = true;
   document.body.appendChild(renderer.domElement);
@@ -256,66 +311,43 @@ function init(){
 
   material = new THREE.ShaderMaterial({
     uniforms: {
-      uTime:   { value: 0 },
-      uPower:  { value: 8 },
-      uDetail: { value: detail },
-      uHue:    { value: hue },
-      uGrow:   { value: growAmt },
-      uFly:    { value: flyDist },
-      uCenter: { value: new THREE.Vector3(0, 1.6, -0.0) }
+      uTime:{value:0}, uPower:{value:8}, uDetail:{value:detail},
+      uHue:{value:hue}, uGrow:{value:growAmt}, uFly:{value:flyDist},
+      uFigure:{value:0}, uCenter:{value:new THREE.Vector3(0,1.6,-2.4)}
     },
-    vertexShader,
-    fragmentShader,
-    side: THREE.BackSide,
-    depthWrite: false,
-    depthTest: false
+    vertexShader, fragmentShader,
+    side: THREE.BackSide, depthWrite:false, depthTest:false
   });
 
-  // Domo que envuelve al espectador. CLAVE para VR: lo parentamos a la cámara,
-  // no lo movemos a mano. Así Three.js rinde la escena una vez por ojo y
-  // 'cameraPosition' en el shader toma la posición REAL de cada ojo -> estéreo.
-  quad = new THREE.Mesh(new THREE.SphereGeometry(20, 32, 16), material);
+  quad = new THREE.Mesh(new THREE.SphereGeometry(20, 24, 12), material);
   quad.frustumCulled = false;
-  camera.add(quad);          // <-- parentado a la cámara
-  scene.add(camera);         // la cámara debe estar en la escena para que el hijo se renderice
+  camera.add(quad);
+  scene.add(camera);
 
-  // El centro del fractal vive en el espacio del mundo, frente a la posición inicial.
-  material.uniforms.uCenter.value.set(0, 1.6, -2.4);
-
-  // En escritorio: rotación de la mirada con el ratón, sin colapsar la cámara.
   controls = new OrbitControls(camera, renderer.domElement);
-  controls.target.set(0, 1.6, -2.4);
+  controls.target.set(0,1.6,-2.4);
   controls.enableDamping = true;
   controls.dampingFactor = 0.06;
   controls.enablePan = false;
-  controls.enableZoom = false;   // el acercamiento es por uFly
-  controls.minDistance = 2.4;
-  controls.maxDistance = 2.4;
+  controls.enableZoom = false;
+  controls.minDistance = 2.4; controls.maxDistance = 2.4;
 
-  renderer.xr.addEventListener('sessionstart', ()=>{
-    document.body.classList.add('xr-active');
-    controls.enabled = false;
-  });
-  renderer.xr.addEventListener('sessionend', ()=>{
-    document.body.classList.remove('xr-active');
-    controls.enabled = true;
-  });
+  renderer.xr.addEventListener('sessionstart', ()=>{ document.body.classList.add('xr-active'); controls.enabled=false; });
+  renderer.xr.addEventListener('sessionend', ()=>{ document.body.classList.remove('xr-active'); controls.enabled=true; });
 
   setupControllers();
   setupUI();
-
   addEventListener('resize', onResize);
   addEventListener('keydown', e=>{ keyboard.add(e.code); if(['KeyW','KeyS'].includes(e.code)){ autoTravel=false; syncAuto(); } });
   addEventListener('keyup', e=>keyboard.delete(e.code));
+  addEventListener('wheel', e=>{ flyDist = Math.max(0.45, Math.min(6.0, flyDist*(1+Math.sign(e.deltaY)*0.05))); autoTravel=false; syncAuto(); }, {passive:true});
 }
 
 function setupControllers(){
   for(let i=0;i<2;i++){
     const c = renderer.xr.getController(i);
-    c.addEventListener('selectstart', ()=>{ autoTravel = !autoTravel; syncAuto(); });
-    // Mantener el gatillo apretado hace avanzar; squeeze retrocede.
-    c.addEventListener('squeezestart', ()=>{ c.userData.reverse = true; });
-    c.addEventListener('squeezeend',   ()=>{ c.userData.reverse = false; });
+    c.addEventListener('squeezestart', ()=>{ c.userData.reverse=true; });
+    c.addEventListener('squeezeend', ()=>{ c.userData.reverse=false; });
     scene.add(c);
     controllers.push(c);
   }
@@ -323,16 +355,26 @@ function setupControllers(){
 
 function setupUI(){
   const $ = id=>document.getElementById(id);
-  $('grow').addEventListener('input', e=>{ growAmt=e.target.value/100; $('vGrow').textContent = growAmt<0.05?'quieto':growAmt<0.5?'suave':'intenso'; });
+  $('grow').addEventListener('input', e=>{ growAmt=e.target.value/100; material.uniforms.uGrow.value=growAmt; $('vGrow').textContent = growAmt<0.05?'quieto':growAmt<0.5?'suave':'intenso'; });
   $('speed').addEventListener('input', e=>{ speed=e.target.value/100*1.8; $('vSpeed').textContent=(speed/0.6).toFixed(1)+'×'; });
   $('detail').addEventListener('input', e=>{ detail=e.target.value/100; material.uniforms.uDetail.value=detail; $('vDetail').textContent = detail<0.34?'baja':detail<0.67?'media':'alta'; });
-  $('hue').addEventListener('input', e=>{ hue=e.target.value/100*6.283; const names=['fuego','ámbar','verdor','turquesa','violeta','magenta']; $('vHue').textContent=names[Math.floor(e.target.value/100*5.99)]; });
+  $('hue').addEventListener('input', e=>{ hue=e.target.value/100*6.283; material.uniforms.uHue.value=hue; const names=['fuego','ámbar','verdor','turquesa','violeta','magenta']; $('vHue').textContent=names[Math.floor(e.target.value/100*5.99)]; });
 
-  const autoBtn=$('autoBtn'), pauseBtn=$('pauseBtn');
+  document.querySelectorAll('#figs button').forEach(b=>{
+    b.addEventListener('click', ()=>{
+      figure = parseInt(b.dataset.fig);
+      material.uniforms.uFigure.value = figure;
+      document.querySelectorAll('#figs button').forEach(x=>x.classList.remove('active'));
+      b.classList.add('active');
+    });
+  });
+
+  const autoBtn=$('autoBtn'), pauseBtn=$('pauseBtn'), perfBtn=$('perfBtn');
   autoBtn.addEventListener('click', ()=>{ autoTravel=!autoTravel; syncAuto(); });
   pauseBtn.addEventListener('click', ()=>{ paused=!paused; pauseBtn.textContent=paused?'Reanudar':'Pausar'; pauseBtn.classList.toggle('active', paused); });
+  perfBtn.addEventListener('click', ()=>{ autoPerf=!autoPerf; perfBtn.classList.toggle('active', autoPerf); });
 }
-function syncAuto(){ const b=document.getElementById('autoBtn'); b.classList.toggle('active', autoTravel); b.textContent = autoTravel?'Auto-viaje':'Manual'; }
+function syncAuto(){ const b=document.getElementById('autoBtn'); if(!b) return; b.classList.toggle('active', autoTravel); b.textContent = autoTravel?'Auto-viaje':'Manual'; }
 
 function onResize(){
   camera.aspect = innerWidth/innerHeight;
@@ -340,71 +382,65 @@ function onResize(){
   renderer.setSize(innerWidth, innerHeight);
 }
 
+// Ajuste dinámico de resolución según fps (no se aplica dentro de XR: el visor manda).
+function updateAdaptiveRes(dt){
+  if(!autoPerf || renderer.xr.isPresenting) return;
+  fpsAccum += dt; fpsFrames++;
+  ratioCooldown -= dt;
+  if(fpsAccum >= 0.5){
+    fpsValue = fpsFrames/fpsAccum;
+    fpsAccum = 0; fpsFrames = 0;
+    if(ratioCooldown <= 0){
+      if(fpsValue < 45 && curRatio > MIN_RATIO){ curRatio = Math.max(MIN_RATIO, curRatio-0.15); renderer.setPixelRatio(curRatio); ratioCooldown=1.0; }
+      else if(fpsValue > 58 && curRatio < MAX_RATIO){ curRatio = Math.min(MAX_RATIO, curRatio+0.1); renderer.setPixelRatio(curRatio); ratioCooldown=1.5; }
+    }
+  }
+}
+
 function render(){
   const dt = Math.min(clock.getDelta(), 0.05);
   if(!paused) simTime += dt;
 
-  // Auto-viaje: nos sumergimos y emergemos del fractal en bucle.
   if(autoTravel && !paused){
-    flyDist = 1.7 + 1.05*Math.sin(simTime*0.13*speed);
-    flyDist = Math.max(0.65, flyDist);
+    flyDist = Math.max(0.65, 1.7 + 1.05*Math.sin(simTime*0.13*speed));
   }
-
-  // Avance manual (escritorio).
   const ks = dt*1.1*speed;
-  if(keyboard.has('KeyW')) flyDist = Math.max(0.45, flyDist - ks);
-  if(keyboard.has('KeyS')) flyDist = Math.min(6.0, flyDist + ks);
+  if(keyboard.has('KeyW')) flyDist = Math.max(0.45, flyDist-ks);
+  if(keyboard.has('KeyS')) flyDist = Math.min(6.0, flyDist+ks);
 
-  // Avance en VR: gatillo apretado avanza, squeeze retrocede.
   if(renderer.xr.isPresenting){
     for(const c of controllers){
-      // Detectar gatillo mediante gamepad del controlador XR.
       const src = c.userData.inputSource;
       if(src && src.gamepad){
-        const trigger = src.gamepad.buttons[0]?.value || 0;
-        if(trigger > 0.1 && !autoTravel) flyDist = Math.max(0.45, flyDist - dt*1.6*speed*trigger);
+        const trig = src.gamepad.buttons[0]?.value || 0;
+        if(trig > 0.1) flyDist = Math.max(0.45, flyDist - dt*1.6*speed*trig);
       }
       if(c.userData.reverse) flyDist = Math.min(6.0, flyDist + dt*1.6*speed);
     }
   }
 
-  // El "power" animado hace crecer/transformar el fractal.
-  const power = 8.0 + Math.sin(simTime*0.25)*1.5*growAmt;
+  material.uniforms.uTime.value = simTime;
+  material.uniforms.uPower.value = 8.0 + Math.sin(simTime*0.25)*1.5*growAmt;
+  material.uniforms.uFly.value = flyDist;
 
-  material.uniforms.uTime.value  = simTime;
-  material.uniforms.uPower.value = power;
-  material.uniforms.uGrow.value  = growAmt;
-  material.uniforms.uFly.value   = flyDist;
-
-  // El domo YA sigue a la cámara (es su hijo): no se reposiciona a mano.
-  // El centro del fractal se mantiene frente a la cámara, en el mundo,
-  // usando su posición y orientación de cuerpo (no la de un ojo concreto),
-  // de modo que ambos ojos comparten el mismo fractal y conservan su paralaje.
-  const camWorld = new THREE.Vector3();
-  const camDir = new THREE.Vector3();
+  const camWorld = new THREE.Vector3(), camDir = new THREE.Vector3();
   camera.getWorldPosition(camWorld);
   camera.getWorldDirection(camDir);
   material.uniforms.uCenter.value.copy(camWorld).addScaledVector(camDir, 2.4);
 
   if(!renderer.xr.isPresenting) controls.update();
+  updateAdaptiveRes(dt);
 
   renderer.render(scene, camera);
 
-  const depthPct = Math.max(0, Math.min(100, (1 - (flyDist-0.45)/(6.0-0.45))*100));
-  const d = document.getElementById('depth');
-  if(d) d.textContent = 'profundidad ' + depthPct.toFixed(0) + '%';
+  const s = document.getElementById('stat');
+  if(s && !renderer.xr.isPresenting) s.innerHTML = 'fps '+fpsValue.toFixed(0)+'<br>res '+(curRatio).toFixed(2)+'×';
 }
 
-// Capturar la fuente de entrada de cada controlador para leer el gatillo.
 renderer.xr.addEventListener('sessionstart', ()=>{
   const s = renderer.xr.getSession();
   if(!s) return;
-  const assign = ()=>{
-    const sources = s.inputSources;
-    for(let i=0;i<controllers.length;i++){
-      controllers[i].userData.inputSource = sources[i];
-    }
-  };
+  const assign = ()=>{ const src=s.inputSources; for(let i=0;i<controllers.length;i++) controllers[i].userData.inputSource = src[i]; };
   s.addEventListener('inputsourceschange', assign);
   assign();
 });
