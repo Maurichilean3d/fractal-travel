@@ -89,11 +89,16 @@
     <label>Color <span id="vHue">violeta</span></label>
     <input id="hue" type="range" min="0" max="100" value="62">
   </div>
+  <div class="ctrl">
+    <label>Apertura del cono <span id="vCone">55°</span></label>
+    <input id="cone" type="range" min="20" max="90" value="55">
+  </div>
 
   <div class="row">
     <button id="autoBtn" class="active">Auto-viaje</button>
     <button id="pauseBtn">Pausar</button>
     <button id="perfBtn" class="active">Auto-calidad</button>
+    <button id="coneBtn" class="active">Cono</button>
   </div>
 
   <div id="keys">
@@ -140,6 +145,9 @@ const fragmentShader = /* glsl */`
   uniform float uTime, uPower, uDetail, uHue, uGrow, uFly;
   uniform int   uFigure;
   uniform vec3  uCenter;
+  uniform vec3  uForward;     // eje de la cámara (mundo), por ojo
+  uniform float uConeCos;     // coseno del semiángulo del cono (1=cerrado, -1=todo)
+  uniform float uConeOn;      // 1 = clipping activo, 0 = desactivado
 
   #define MAX_STEPS 96
   #define MAX_DIST  12.0
@@ -248,13 +256,13 @@ const fragmentShader = /* glsl */`
     return 0.5 + 0.5*cos(6.28318*(vec3(1.0)*t + vec3(0.0,0.33,0.67) + uHue));
   }
 
-  void main(){
-    vec3 ro = cameraPosition;
-    vec3 rd = normalize(vDir);
-
+  // Raymarching + sombreado. 'fove' (0..1) modula los pasos: 1 en el foco,
+  // menos hacia el borde del cono -> foveated rendering barato.
+  void marchAndShade(vec3 ro, vec3 rd, float fove, vec3 voidCol){
     float t = 0.0, trap = 0.0, glow = 0.0;
     bool hit = false;
-    int steps = int(48.0 + uDetail*40.0);   // menos pasos base; sube con detalle
+    // Pasos plenos en el centro; hasta ~45% menos en el borde del cono.
+    int steps = int((48.0 + uDetail*40.0) * (0.55 + 0.45*fove));
 
     for(int i=0;i<MAX_STEPS;i++){
       if(i>=steps) break;
@@ -262,7 +270,6 @@ const fragmentShader = /* glsl */`
       float tr;
       float d = map(p, tr);
       glow += 0.012 / (1.0 + d*d*160.0);
-      // Umbral adaptativo: tolerancia crece con la distancia -> termina antes lejos
       float eps = 0.0006 + t*0.0012;
       if(d < eps){ hit = true; trap = tr; break; }
       t += d*0.9;
@@ -287,7 +294,37 @@ const fragmentShader = /* glsl */`
     }
     col += palette(uHue+0.15+glow*0.3)*glow*(0.55 + uGrow*0.5);
     col = pow(col, vec3(0.85));
+    // Fundido hacia el vacío en la banda del borde del cono.
+    col = mix(voidCol, col, clamp(fove, 0.0, 1.0));
     gl_FragColor = vec4(col, 1.0);
+  }
+
+  void main(){
+    vec3 ro = cameraPosition;
+    vec3 rd = normalize(vDir);
+
+    // --- CONO DE RENDERIZADO ---
+    // Ángulo del rayo respecto al eje de la cámara. Cuanto más cerca de 1,
+    // más centrado en la mirada está el píxel.
+    float cosAng = dot(rd, normalize(uForward));
+    vec3 voidCol = vec3(0.010, 0.007, 0.026);
+
+    if(uConeOn > 0.5){
+      // Fuera del cono: descartar el raymarching por completo (ahorro máximo).
+      // Banda de transición suave para evitar un borde duro.
+      float edge = smoothstep(uConeCos - 0.06, uConeCos, cosAng);
+      if(cosAng < uConeCos - 0.06){
+        gl_FragColor = vec4(voidCol, 1.0);
+        return;
+      }
+      // 'fove' = 1 en el centro del cono, baja hacia el borde -> menos pasos ahí.
+      float fove = edge;
+      marchAndShade(ro, rd, fove, voidCol);
+      return;
+    }
+
+    // Cono desactivado: calidad uniforme en todo el cuadro.
+    marchAndShade(ro, rd, 1.0, voidCol);
   }
 `;
 
@@ -313,7 +350,10 @@ function init(){
     uniforms: {
       uTime:{value:0}, uPower:{value:8}, uDetail:{value:detail},
       uHue:{value:hue}, uGrow:{value:growAmt}, uFly:{value:flyDist},
-      uFigure:{value:0}, uCenter:{value:new THREE.Vector3(0,1.6,-2.4)}
+      uFigure:{value:0}, uCenter:{value:new THREE.Vector3(0,1.6,-2.4)},
+      uForward:{value:new THREE.Vector3(0,0,-1)},
+      uConeCos:{value:Math.cos(THREE.MathUtils.degToRad(55))},
+      uConeOn:{value:1}
     },
     vertexShader, fragmentShader,
     side: THREE.BackSide, depthWrite:false, depthTest:false
@@ -332,8 +372,18 @@ function init(){
   controls.enableZoom = false;
   controls.minDistance = 2.4; controls.maxDistance = 2.4;
 
-  renderer.xr.addEventListener('sessionstart', ()=>{ document.body.classList.add('xr-active'); controls.enabled=false; });
-  renderer.xr.addEventListener('sessionend', ()=>{ document.body.classList.remove('xr-active'); controls.enabled=true; });
+  renderer.xr.addEventListener('sessionstart', ()=>{
+    document.body.classList.add('xr-active');
+    controls.enabled=false;
+    // En VR recortar el FOV produce efecto túnel; lo desactivamos por defecto.
+    material.uniforms.uConeOn.value = 0;
+  });
+  renderer.xr.addEventListener('sessionend', ()=>{
+    document.body.classList.remove('xr-active');
+    controls.enabled=true;
+    const b=document.getElementById('coneBtn');
+    material.uniforms.uConeOn.value = (b && b.classList.contains('active')) ? 1 : 0;
+  });
 
   setupControllers();
   setupUI();
@@ -359,6 +409,7 @@ function setupUI(){
   $('speed').addEventListener('input', e=>{ speed=e.target.value/100*1.8; $('vSpeed').textContent=(speed/0.6).toFixed(1)+'×'; });
   $('detail').addEventListener('input', e=>{ detail=e.target.value/100; material.uniforms.uDetail.value=detail; $('vDetail').textContent = detail<0.34?'baja':detail<0.67?'media':'alta'; });
   $('hue').addEventListener('input', e=>{ hue=e.target.value/100*6.283; material.uniforms.uHue.value=hue; const names=['fuego','ámbar','verdor','turquesa','violeta','magenta']; $('vHue').textContent=names[Math.floor(e.target.value/100*5.99)]; });
+  $('cone').addEventListener('input', e=>{ const deg=Number(e.target.value); material.uniforms.uConeCos.value=Math.cos(THREE.MathUtils.degToRad(deg)); $('vCone').textContent=deg+'°'; });
 
   document.querySelectorAll('#figs button').forEach(b=>{
     b.addEventListener('click', ()=>{
@@ -369,10 +420,11 @@ function setupUI(){
     });
   });
 
-  const autoBtn=$('autoBtn'), pauseBtn=$('pauseBtn'), perfBtn=$('perfBtn');
+  const autoBtn=$('autoBtn'), pauseBtn=$('pauseBtn'), perfBtn=$('perfBtn'), coneBtn=$('coneBtn');
   autoBtn.addEventListener('click', ()=>{ autoTravel=!autoTravel; syncAuto(); });
   pauseBtn.addEventListener('click', ()=>{ paused=!paused; pauseBtn.textContent=paused?'Reanudar':'Pausar'; pauseBtn.classList.toggle('active', paused); });
   perfBtn.addEventListener('click', ()=>{ autoPerf=!autoPerf; perfBtn.classList.toggle('active', autoPerf); });
+  coneBtn.addEventListener('click', ()=>{ const on = material.uniforms.uConeOn.value > 0.5; material.uniforms.uConeOn.value = on?0:1; coneBtn.classList.toggle('active', !on); });
 }
 function syncAuto(){ const b=document.getElementById('autoBtn'); if(!b) return; b.classList.toggle('active', autoTravel); b.textContent = autoTravel?'Auto-viaje':'Manual'; }
 
@@ -427,6 +479,7 @@ function render(){
   camera.getWorldPosition(camWorld);
   camera.getWorldDirection(camDir);
   material.uniforms.uCenter.value.copy(camWorld).addScaledVector(camDir, 2.4);
+  material.uniforms.uForward.value.copy(camDir);   // eje del cono = mirada
 
   if(!renderer.xr.isPresenting) controls.update();
   updateAdaptiveRes(dt);
