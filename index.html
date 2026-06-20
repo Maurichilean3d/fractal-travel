@@ -271,22 +271,26 @@ function init(){
     depthTest: false
   });
 
-  // Domo que envuelve al espectador: el raymarching se evalúa en su superficie
-  // y, al estar pegado a la cámara, cubre todo el campo de visión en ambos ojos.
+  // Domo que envuelve al espectador. CLAVE para VR: lo parentamos a la cámara,
+  // no lo movemos a mano. Así Three.js rinde la escena una vez por ojo y
+  // 'cameraPosition' en el shader toma la posición REAL de cada ojo -> estéreo.
   quad = new THREE.Mesh(new THREE.SphereGeometry(20, 32, 16), material);
   quad.frustumCulled = false;
-  scene.add(quad);
+  camera.add(quad);          // <-- parentado a la cámara
+  scene.add(camera);         // la cámara debe estar en la escena para que el hijo se renderice
 
-  // El centro del fractal está justo frente al espectador.
+  // El centro del fractal vive en el espacio del mundo, frente a la posición inicial.
   material.uniforms.uCenter.value.set(0, 1.6, -2.4);
 
+  // En escritorio: rotación de la mirada con el ratón, sin colapsar la cámara.
   controls = new OrbitControls(camera, renderer.domElement);
   controls.target.set(0, 1.6, -2.4);
   controls.enableDamping = true;
   controls.dampingFactor = 0.06;
   controls.enablePan = false;
-  controls.minDistance = 0.001;
-  controls.maxDistance = 0.001; // la cámara rota en sitio; el viaje es por uFly
+  controls.enableZoom = false;   // el acercamiento es por uFly
+  controls.minDistance = 2.4;
+  controls.maxDistance = 2.4;
 
   renderer.xr.addEventListener('sessionstart', ()=>{
     document.body.classList.add('xr-active');
@@ -372,12 +376,15 @@ function render(){
   material.uniforms.uGrow.value  = growAmt;
   material.uniforms.uFly.value   = flyDist;
 
-  // El domo sigue a la cámara para envolver siempre la vista (también en VR).
+  // El domo YA sigue a la cámara (es su hijo): no se reposiciona a mano.
+  // El centro del fractal se mantiene frente a la cámara, en el mundo,
+  // usando su posición y orientación de cuerpo (no la de un ojo concreto),
+  // de modo que ambos ojos comparten el mismo fractal y conservan su paralaje.
   const camWorld = new THREE.Vector3();
+  const camDir = new THREE.Vector3();
   camera.getWorldPosition(camWorld);
-  quad.position.copy(camWorld);
-  // El centro del fractal se mantiene a una distancia fija frente a la cámara base.
-  material.uniforms.uCenter.value.set(camWorld.x, camWorld.y, camWorld.z - 2.4);
+  camera.getWorldDirection(camDir);
+  material.uniforms.uCenter.value.copy(camWorld).addScaledVector(camDir, 2.4);
 
   if(!renderer.xr.isPresenting) controls.update();
 
