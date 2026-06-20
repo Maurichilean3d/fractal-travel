@@ -1,4 +1,4 @@
-// Ajuste dinámico de resolución según fps (no se aplica <!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="UTF-8" />
@@ -165,14 +165,16 @@ const fragmentShader = /* glsl */`
     int it = int(5.0 + uDetail*6.0);
     for(int i=0;i<11;i++){
       if(i>=it) break;
-      r = length(z);
+      r = max(length(z), 1e-6);
+      trap = min(trap, r);
       if(r>2.0) break;
-      float th = acos(z.z/r), ph = atan(z.y,z.x);
+      float th = acos(clamp(z.z/r, -1.0, 1.0));
+      float ph = atan(z.y,z.x);
       dr = pow(r,uPower-1.0)*uPower*dr + 1.0;
       float zr = pow(r,uPower); th*=uPower; ph*=uPower;
       z = zr*vec3(sin(th)*cos(ph), sin(th)*sin(ph), cos(th)) + p;
-      trap = min(trap, r);
     }
+    r = max(r, 1e-6);
     return 0.5*log(r)*r/dr;
   }
 
@@ -402,24 +404,33 @@ function init(){
   // Posición inicial del rig: a 'travelDist' del fractal, mirándolo.
   positionRig();
 
-  // OrbitControls SOLO en escritorio: orbita alrededor del fractal fijo.
-  controls = new OrbitControls(camera, renderer.domElement);
+  // OrbitControls SOLO en escritorio. Se aplica al rig, no a la cámara:
+  // así evitamos mezclar coordenadas locales de una cámara hija con coordenadas de mundo.
+  controls = new OrbitControls(camRig, renderer.domElement);
   controls.target.copy(FRACTAL_CENTER);
   controls.enableDamping = true;
   controls.dampingFactor = 0.06;
   controls.enablePan = false;
   controls.enableZoom = false;
   controls.minDistance = travelDist; controls.maxDistance = travelDist;
+  controls.update();
 
   renderer.xr.addEventListener('sessionstart', ()=>{
     document.body.classList.add('xr-active');
     controls.enabled=false;
+    // Al entrar a VR, limpiamos cualquier rotación de OrbitControls en el rig.
+    // La orientación de la cabeza la debe manejar el visor.
+    camRig.quaternion.identity();
+    positionRig();
     // En VR recortar el FOV produce efecto túnel; lo desactivamos por defecto.
     material.uniforms.uConeOn.value = 0;
   });
   renderer.xr.addEventListener('sessionend', ()=>{
     document.body.classList.remove('xr-active');
     controls.enabled=true;
+    controls.target.copy(FRACTAL_CENTER);
+    controls.minDistance = controls.maxDistance = travelDist;
+    controls.update();
     const b=document.getElementById('coneBtn');
     material.uniforms.uConeOn.value = (b && b.classList.contains('active')) ? 1 : 0;
   });
@@ -429,7 +440,12 @@ function init(){
   addEventListener('resize', onResize);
   addEventListener('keydown', e=>{ keyboard.add(e.code); if(['KeyW','KeyS'].includes(e.code)){ autoTravel=false; syncAuto(); } });
   addEventListener('keyup', e=>keyboard.delete(e.code));
-  addEventListener('wheel', e=>{ travelDist = Math.max(TRAVEL_MIN, Math.min(TRAVEL_MAX, travelDist*(1+Math.sign(e.deltaY)*0.05))); autoTravel=false; syncAuto(); }, {passive:true});
+  addEventListener('wheel', e=>{
+    e.preventDefault();
+    travelDist = Math.max(TRAVEL_MIN, Math.min(TRAVEL_MAX, travelDist*(1+Math.sign(e.deltaY)*0.05)));
+    autoTravel=false;
+    syncAuto();
+  }, {passive:false});
 }
 
 // Coloca el rig a 'travelDist' del fractal, sobre el eje Z, mirándolo.
@@ -443,6 +459,10 @@ function positionRig(){
 function setupControllers(){
   for(let i=0;i<2;i++){
     const c = renderer.xr.getController(i);
+    c.userData.inputSource = null;
+    c.userData.reverse = false;
+    c.addEventListener('connected', event=>{ c.userData.inputSource = event.data; });
+    c.addEventListener('disconnected', ()=>{ c.userData.inputSource = null; c.userData.reverse = false; });
     c.addEventListener('squeezestart', ()=>{ c.userData.reverse=true; });
     c.addEventListener('squeezeend', ()=>{ c.userData.reverse=false; });
     scene.add(c);
@@ -472,6 +492,12 @@ function setupUI(){
   pauseBtn.addEventListener('click', ()=>{ paused=!paused; pauseBtn.textContent=paused?'Reanudar':'Pausar'; pauseBtn.classList.toggle('active', paused); });
   perfBtn.addEventListener('click', ()=>{ autoPerf=!autoPerf; perfBtn.classList.toggle('active', autoPerf); });
   coneBtn.addEventListener('click', ()=>{ const on = material.uniforms.uConeOn.value > 0.5; material.uniforms.uConeOn.value = on?0:1; coneBtn.classList.toggle('active', !on); });
+
+  syncUIValues();
+}
+function syncUIValues(){
+  const fire = id => document.getElementById(id).dispatchEvent(new Event('input'));
+  ['grow','speed','detail','hue','cone'].forEach(fire);
 }
 function syncAuto(){ const b=document.getElementById('autoBtn'); if(!b) return; b.classList.toggle('active', autoTravel); b.textContent = autoTravel?'Auto-viaje':'Manual'; }
 
@@ -502,8 +528,8 @@ function render(){
 
   // Auto-viaje: oscila la DISTANCIA al fractal (acercarse / alejarse).
   if(autoTravel && !paused){
-    travelDist = TRAVEL_MIN + (TRAVEL_MAX-TRAVEL_MIN)*0.5*(1.05 + Math.sin(simTime*0.13*speed))*0.5;
-    travelDist = Math.min(TRAVEL_MAX, Math.max(TRAVEL_MIN, travelDist));
+    const wave = 0.5 + 0.5*Math.sin(simTime*0.13*speed);
+    travelDist = THREE.MathUtils.lerp(TRAVEL_MAX, TRAVEL_MIN, wave);
   }
   const ks = dt*1.4*speed;
   if(keyboard.has('KeyW')) travelDist = Math.max(TRAVEL_MIN, travelDist-ks);
@@ -554,13 +580,7 @@ function render(){
   if(s && !renderer.xr.isPresenting) s.innerHTML = 'fps '+fpsValue.toFixed(0)+'<br>res '+(curRatio).toFixed(2)+'×';
 }
 
-renderer.xr.addEventListener('sessionstart', ()=>{
-  const s = renderer.xr.getSession();
-  if(!s) return;
-  const assign = ()=>{ const src=s.inputSources; for(let i=0;i<controllers.length;i++) controllers[i].userData.inputSource = src[i]; };
-  s.addEventListener('inputsourceschange', assign);
-  assign();
-});
 </script>
 </body>
-</html> de XR: el visor manda).
+</html>
+    
