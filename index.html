@@ -3,13 +3,11 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Viaje Fractal — Mandelbulb Vivo</title>
+<title>Viaje Fractal VR — Mandelbulb Vivo</title>
 <style>
   :root { color-scheme: dark; }
   html,body { margin:0; width:100%; height:100%; overflow:hidden; background:#000; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
-  canvas { display:block; width:100%; height:100%; touch-action:none; cursor:grab; }
-  canvas:active { cursor:grabbing; }
-
+  canvas { display:block; }
   #hud {
     position:fixed; left:16px; top:16px; z-index:5;
     width:min(320px, calc(100vw - 32px));
@@ -42,6 +40,12 @@
   button.active { background:rgba(150,120,255,.5); border-color:rgba(190,170,255,.6); }
   #keys { margin-top:12px; font-size:10px; line-height:1.5; color:rgba(190,200,235,.5); }
   #keys b { color:rgba(214,224,255,.78); font-weight:600; }
+  body.xr-active #hud { display:none; }
+
+  /* Botón VR de Three.js: lo dejamos abajo centrado y visible */
+  #VRButton {
+    z-index: 6 !important;
+  }
   #depth {
     position:fixed; right:16px; bottom:16px; z-index:5;
     font-size:11px; color:rgba(200,210,255,.7);
@@ -49,33 +53,33 @@
     border-radius:10px; padding:7px 11px; backdrop-filter:blur(8px);
     font-variant-numeric:tabular-nums;
   }
-  #hint {
-    position:fixed; left:50%; bottom:18px; transform:translateX(-50%);
-    z-index:5; font-size:11px; color:rgba(210,215,255,.55);
-    background:rgba(10,8,26,.5); padding:6px 14px; border-radius:999px;
-    border:1px solid rgba(150,130,255,.18); backdrop-filter:blur(8px);
-    transition:opacity .6s ease;
-  }
+  body.xr-active #depth { display:none; }
 </style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
 </head>
 <body>
-<canvas id="gl"></canvas>
-
 <div id="hud">
-  <h1>VIAJE FRACTAL</h1>
-  <p class="sub">Mandelbulb vivo por raymarching. Vuela hacia la superficie: el detalle nunca se agota.</p>
+  <h1>VIAJE FRACTAL VR</h1>
+  <p class="sub">Mandelbulb vivo por raymarching. Pulsa “Enter VR” en Quest, o vuela en escritorio.</p>
 
   <div class="ctrl">
-    <label>Desarrollo <span id="vGrow">activo</span></label>
+    <label>Desarrollo <span id="vGrow">suave</span></label>
     <input id="grow" type="range" min="0" max="100" value="40">
   </div>
   <div class="ctrl">
-    <label>Velocidad de vuelo <span id="vSpeed">1.0×</span></label>
+    <label>Velocidad de viaje <span id="vSpeed">1.0×</span></label>
     <input id="speed" type="range" min="0" max="100" value="35">
   </div>
   <div class="ctrl">
     <label>Detalle / iteraciones <span id="vDetail">media</span></label>
-    <input id="detail" type="range" min="0" max="100" value="50">
+    <input id="detail" type="range" min="0" max="100" value="46">
   </div>
   <div class="ctrl">
     <label>Color <span id="vHue">violeta</span></label>
@@ -88,309 +92,315 @@
   </div>
 
   <div id="keys">
-    <b>Arrastra</b> para orientar · <b>Rueda</b> acerca/aleja<br>
-    <b>W/S</b> avanzar/retroceder · <b>A/D/Q/E</b> desplazar
+    <b>Escritorio:</b> arrastra para mirar · rueda y W/S para avanzar<br>
+    <b>VR:</b> gatillo = auto-viaje on/off · stick/empuje = avanzar
   </div>
 </div>
 
 <div id="depth">profundidad —</div>
-<div id="hint">arrastra para mirar · rueda para sumergirte</div>
 
-<script id="vert" type="x-shader/x-vertex">
-attribute vec2 aPos;
-void main(){ gl_Position = vec4(aPos, 0.0, 1.0); }
-</script>
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-<script id="frag" type="x-shader/x-fragment">
-precision highp float;
+let renderer, scene, camera, controls, clock, quad, material;
+let autoTravel = true, paused = false;
 
-uniform vec2  uRes;
-uniform float uTime;
-uniform vec3  uCamPos;
-uniform mat3  uCamRot;
-uniform float uPower;      // exponente del Mandelbulb (animado = crecimiento)
-uniform float uDetail;     // factor de iteraciones / pasos
-uniform float uHue;        // base de color
-uniform float uGrow;       // intensidad de pulsación
+let growAmt = 0.40, speed = 0.6, detail = 0.46, hue = 0.62 * 6.283;
+// "flyOffset" desplaza el espacio del fractal: así viajamos hacia su interior.
+let flyDist = 2.6;            // distancia de inmersión (más pequeño = más dentro)
+let simTime = 0;
+const keyboard = new Set();
+const controllers = [];
 
-#define MAX_STEPS 150
-#define MAX_DIST  12.0
-#define SURF      0.00035
-
-// Distancia estimada al Mandelbulb + atrapado orbital para coloreo.
-float mandelbulb(vec3 pos, out float trap){
-  vec3 z = pos;
-  float dr = 1.0;
-  float r = 0.0;
-  trap = 1e10;
-  int iters = int(6.0 + uDetail * 8.0);
-  for(int i=0;i<14;i++){
-    if(i>=iters) break;
-    r = length(z);
-    if(r > 2.0) break;
-    // a coordenadas polares
-    float theta = acos(z.z / r);
-    float phi   = atan(z.y, z.x);
-    dr = pow(r, uPower-1.0)*uPower*dr + 1.0;
-    // escalar y rotar
-    float zr = pow(r, uPower);
-    theta *= uPower;
-    phi   *= uPower;
-    z = zr * vec3(sin(theta)*cos(phi), sin(theta)*sin(phi), cos(theta));
-    z += pos;
-    trap = min(trap, r);
+const vertexShader = /* glsl */`
+  varying vec3 vWorldDir;
+  varying vec3 vCamPos;
+  void main(){
+    // Reconstruir el rayo del mundo por ojo desde las matrices de la cámara.
+    vec4 worldPos = modelMatrix * vec4(position, 1.0);
+    vCamPos = cameraPosition;
+    vWorldDir = worldPos.xyz - cameraPosition;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
   }
-  return 0.5 * log(r) * r / dr;
-}
+`;
 
-float map(vec3 p, out float trap){
-  return mandelbulb(p, trap);
-}
+const fragmentShader = /* glsl */`
+  precision highp float;
+  varying vec3 vWorldDir;
+  varying vec3 vCamPos;
 
-vec3 calcNormal(vec3 p){
-  vec2 e = vec2(0.0009, 0.0);
-  float t;
-  return normalize(vec3(
-    map(p+e.xyy,t)-map(p-e.xyy,t),
-    map(p+e.yxy,t)-map(p-e.yxy,t),
-    map(p+e.yyx,t)-map(p-e.yyx,t)
-  ));
-}
+  uniform float uTime;
+  uniform float uPower;
+  uniform float uDetail;
+  uniform float uHue;
+  uniform float uGrow;
+  uniform float uFly;       // escala de inmersión
+  uniform vec3  uCenter;    // centro del fractal en el mundo
 
-// paleta cíclica
-vec3 palette(float t){
-  vec3 a = vec3(0.5);
-  vec3 b = vec3(0.5);
-  vec3 c = vec3(1.0, 1.0, 1.0);
-  vec3 d = vec3(0.0, 0.33, 0.67) + uHue;
-  return a + b*cos(6.28318*(c*t + d));
-}
+  #define MAX_STEPS 140
+  #define MAX_DIST  14.0
+  #define SURF      0.00045
 
-void main(){
-  vec2 uv = (gl_FragCoord.xy - 0.5*uRes) / uRes.y;
-  vec3 ro = uCamPos;
-  vec3 rd = normalize(uCamRot * vec3(uv, -1.3));
-
-  float t = 0.0;
-  float trap = 0.0;
-  float glow = 0.0;
-  bool hit = false;
-  int steps = int(80.0 + uDetail*70.0);
-
-  for(int i=0;i<MAX_STEPS;i++){
-    if(i>=steps) break;
-    vec3 p = ro + rd*t;
-    float tr;
-    float d = map(p, tr);
-    // resplandor volumétrico: acumula cercanía a la superficie
-    glow += 0.014 / (1.0 + d*d*140.0);
-    if(d < SURF*(1.0 + t*0.5)){ hit = true; trap = tr; break; }
-    t += d*0.85;
-    if(t > MAX_DIST) break;
-  }
-
-  vec3 col = vec3(0.0);
-
-  if(hit){
-    vec3 p = ro + rd*t;
-    vec3 n = calcNormal(p);
-    vec3 lightDir = normalize(vec3(0.6, 0.7, 0.4));
-    float diff = clamp(dot(n, lightDir), 0.0, 1.0);
-    float amb  = 0.35 + 0.65*n.y;
-    // oclusión ambiental por distancia recorrida
-    float ao = 1.0 / (1.0 + t*0.35);
-    // color por atrapado orbital -> revela bandas internas del fractal
-    vec3 base = palette(trap*1.6 + uTime*0.02);
-    vec3 base2 = palette(trap*2.4 + 0.4);
-    base = mix(base, base2, 0.4);
-    col = base * (0.25 + diff*0.9) * (0.5 + amb*0.5) * ao;
-    // brillo especular sutil
-    vec3 h = normalize(lightDir - rd);
-    col += vec3(1.0,0.95,0.9) * pow(clamp(dot(n,h),0.0,1.0), 28.0) * 0.4;
-    // niebla hacia el fondo
-    col = mix(col, vec3(0.02,0.01,0.05), clamp(t/MAX_DIST, 0.0, 1.0)*0.6);
-  } else {
-    // fondo profundo
-    col = vec3(0.015, 0.01, 0.035) * (1.0 - length(uv)*0.4);
-  }
-
-  // resplandor del halo fractal
-  vec3 glowCol = palette(uHue + 0.15 + glow*0.3);
-  col += glowCol * glow * (0.6 + uGrow*0.5);
-
-  // viñeta y tono
-  col *= 1.0 - 0.35*dot(uv,uv);
-  col = pow(col, vec3(0.85)); // gamma suave
-  gl_FragColor = vec4(col, 1.0);
-}
-</script>
-
-<script>
-(function(){
-  const canvas = document.getElementById('gl');
-  const gl = canvas.getContext('webgl', { antialias:false, powerPreference:'high-performance' });
-  if(!gl){ document.body.innerHTML = '<p style="color:#fff;padding:24px;font-family:sans-serif">Tu navegador no soporta WebGL.</p>'; return; }
-
-  // --- compilar shaders ---
-  function compile(type, src){
-    const s = gl.createShader(type);
-    gl.shaderSource(s, src);
-    gl.compileShader(s);
-    if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
-      console.error(gl.getShaderInfoLog(s));
-      throw new Error('shader compile');
+  float mandelbulb(vec3 pos, out float trap){
+    vec3 z = pos;
+    float dr = 1.0;
+    float r = 0.0;
+    trap = 1e10;
+    int iters = int(6.0 + uDetail * 8.0);
+    for(int i=0;i<14;i++){
+      if(i>=iters) break;
+      r = length(z);
+      if(r > 2.0) break;
+      float theta = acos(z.z / r);
+      float phi   = atan(z.y, z.x);
+      dr = pow(r, uPower-1.0)*uPower*dr + 1.0;
+      float zr = pow(r, uPower);
+      theta *= uPower;
+      phi   *= uPower;
+      z = zr * vec3(sin(theta)*cos(phi), sin(theta)*sin(phi), cos(theta));
+      z += pos;
+      trap = min(trap, r);
     }
-    return s;
+    return 0.5 * log(r) * r / dr;
   }
-  const prog = gl.createProgram();
-  gl.attachShader(prog, compile(gl.VERTEX_SHADER, document.getElementById('vert').textContent));
-  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, document.getElementById('frag').textContent));
-  gl.linkProgram(prog);
-  if(!gl.getProgramParameter(prog, gl.LINK_STATUS)){ console.error(gl.getProgramInfoLog(prog)); throw new Error('link'); }
-  gl.useProgram(prog);
 
-  // quad a pantalla completa
-  const buf = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
-  const aPos = gl.getAttribLocation(prog, 'aPos');
-  gl.enableVertexAttribArray(aPos);
-  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+  float map(vec3 p, out float trap){
+    // Llevar el punto del mundo al espacio local del fractal.
+    vec3 q = (p - uCenter) / uFly;
+    return mandelbulb(q, trap) * uFly;
+  }
 
-  const U = {};
-  ['uRes','uTime','uCamPos','uCamRot','uPower','uDetail','uHue','uGrow'].forEach(n=>{
-    U[n] = gl.getUniformLocation(prog, n);
+  vec3 calcNormal(vec3 p){
+    vec2 e = vec2(0.0012, 0.0);
+    float t;
+    return normalize(vec3(
+      map(p+e.xyy,t)-map(p-e.xyy,t),
+      map(p+e.yxy,t)-map(p-e.yxy,t),
+      map(p+e.yyx,t)-map(p-e.yyx,t)
+    ));
+  }
+
+  vec3 palette(float t){
+    vec3 a = vec3(0.5);
+    vec3 b = vec3(0.5);
+    vec3 c = vec3(1.0);
+    vec3 d = vec3(0.0, 0.33, 0.67) + uHue;
+    return a + b*cos(6.28318*(c*t + d));
+  }
+
+  void main(){
+    vec3 ro = vCamPos;
+    vec3 rd = normalize(vWorldDir);
+
+    float t = 0.0;
+    float trap = 0.0;
+    float glow = 0.0;
+    bool hit = false;
+    int steps = int(70.0 + uDetail*70.0);
+
+    for(int i=0;i<MAX_STEPS;i++){
+      if(i>=steps) break;
+      vec3 p = ro + rd*t;
+      float tr;
+      float d = map(p, tr);
+      glow += 0.013 / (1.0 + d*d*150.0);
+      if(d < SURF*(1.0 + t*0.4)){ hit = true; trap = tr; break; }
+      t += d*0.82;
+      if(t > MAX_DIST) break;
+    }
+
+    vec3 col;
+    if(hit){
+      vec3 p = ro + rd*t;
+      vec3 n = calcNormal(p);
+      vec3 lightDir = normalize(vec3(0.6, 0.7, 0.4));
+      float diff = clamp(dot(n, lightDir), 0.0, 1.0);
+      float amb  = 0.35 + 0.65*n.y;
+      float ao = 1.0 / (1.0 + t*0.3);
+      vec3 base  = palette(trap*1.6 + uTime*0.02);
+      vec3 base2 = palette(trap*2.4 + 0.4);
+      base = mix(base, base2, 0.4);
+      col = base * (0.25 + diff*0.9) * (0.5 + amb*0.5) * ao;
+      vec3 h = normalize(lightDir - rd);
+      col += vec3(1.0,0.95,0.9) * pow(clamp(dot(n,h),0.0,1.0), 28.0) * 0.4;
+      col = mix(col, vec3(0.02,0.01,0.05), clamp(t/MAX_DIST, 0.0, 1.0)*0.55);
+    } else {
+      col = vec3(0.012, 0.008, 0.03);
+    }
+
+    vec3 glowCol = palette(uHue + 0.15 + glow*0.3);
+    col += glowCol * glow * (0.55 + uGrow*0.5);
+    col = pow(col, vec3(0.85));
+    gl_FragColor = vec4(col, 1.0);
+  }
+`;
+
+init();
+renderer.setAnimationLoop(render);
+
+function init(){
+  clock = new THREE.Clock();
+  scene = new THREE.Scene();
+
+  camera = new THREE.PerspectiveCamera(72, innerWidth/innerHeight, 0.01, 100);
+  camera.position.set(0, 1.6, 0);
+
+  renderer = new THREE.WebGLRenderer({ antialias:false, powerPreference:'high-performance' });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.xr.enabled = true;
+  document.body.appendChild(renderer.domElement);
+  document.body.appendChild(VRButton.createButton(renderer));
+
+  material = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime:   { value: 0 },
+      uPower:  { value: 8 },
+      uDetail: { value: detail },
+      uHue:    { value: hue },
+      uGrow:   { value: growAmt },
+      uFly:    { value: flyDist },
+      uCenter: { value: new THREE.Vector3(0, 1.6, -0.0) }
+    },
+    vertexShader,
+    fragmentShader,
+    side: THREE.BackSide,
+    depthWrite: false,
+    depthTest: false
   });
 
-  // --- estado de cámara ---
-  // La cámara orbita y se sumerge hacia el origen del fractal.
-  let yaw = 0.3, pitch = -0.15;
-  let dist = 2.6;            // distancia al centro
-  let autoTravel = true;
-  let paused = false;
+  // Domo que envuelve al espectador: el raymarching se evalúa en su superficie
+  // y, al estar pegado a la cámara, cubre todo el campo de visión en ambos ojos.
+  quad = new THREE.Mesh(new THREE.SphereGeometry(20, 32, 16), material);
+  quad.frustumCulled = false;
+  scene.add(quad);
 
-  let growAmt = 0.40;
-  let speed   = 0.6;
-  let detail  = 0.50;
-  let hue     = 0.62 * 6.283;
+  // El centro del fractal está justo frente al espectador.
+  material.uniforms.uCenter.value.set(0, 1.6, -2.4);
 
-  const keys = new Set();
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 1.6, -2.4);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.06;
+  controls.enablePan = false;
+  controls.minDistance = 0.001;
+  controls.maxDistance = 0.001; // la cámara rota en sitio; el viaje es por uFly
 
-  // --- interacción ---
-  let dragging = false, lastX=0, lastY=0;
-  canvas.addEventListener('pointerdown', e=>{ dragging=true; lastX=e.clientX; lastY=e.clientY; autoTravel=false; setAuto(); canvas.setPointerCapture(e.pointerId); hideHint(); });
-  canvas.addEventListener('pointermove', e=>{
-    if(!dragging) return;
-    yaw   -= (e.clientX-lastX)*0.005;
-    pitch -= (e.clientY-lastY)*0.005;
-    pitch = Math.max(-1.5, Math.min(1.5, pitch));
-    lastX=e.clientX; lastY=e.clientY;
+  renderer.xr.addEventListener('sessionstart', ()=>{
+    document.body.classList.add('xr-active');
+    controls.enabled = false;
   });
-  canvas.addEventListener('pointerup', e=>{ dragging=false; });
-  canvas.addEventListener('wheel', e=>{
-    e.preventDefault();
-    dist *= (1 + Math.sign(e.deltaY)*0.06);
-    dist = Math.max(0.55, Math.min(6.0, dist));
-    autoTravel=false; setAuto(); hideHint();
-  }, {passive:false});
+  renderer.xr.addEventListener('sessionend', ()=>{
+    document.body.classList.remove('xr-active');
+    controls.enabled = true;
+  });
 
-  window.addEventListener('keydown', e=>{ keys.add(e.code); if(['KeyW','KeyS','KeyA','KeyD','KeyQ','KeyE'].includes(e.code)){ autoTravel=false; setAuto(); hideHint(); } });
-  window.addEventListener('keyup', e=>keys.delete(e.code));
+  setupControllers();
+  setupUI();
 
-  // --- UI ---
+  addEventListener('resize', onResize);
+  addEventListener('keydown', e=>{ keyboard.add(e.code); if(['KeyW','KeyS'].includes(e.code)){ autoTravel=false; syncAuto(); } });
+  addEventListener('keyup', e=>keyboard.delete(e.code));
+}
+
+function setupControllers(){
+  for(let i=0;i<2;i++){
+    const c = renderer.xr.getController(i);
+    c.addEventListener('selectstart', ()=>{ autoTravel = !autoTravel; syncAuto(); });
+    // Mantener el gatillo apretado hace avanzar; squeeze retrocede.
+    c.addEventListener('squeezestart', ()=>{ c.userData.reverse = true; });
+    c.addEventListener('squeezeend',   ()=>{ c.userData.reverse = false; });
+    scene.add(c);
+    controllers.push(c);
+  }
+}
+
+function setupUI(){
   const $ = id=>document.getElementById(id);
-  $('grow').addEventListener('input', e=>{ growAmt = e.target.value/100; $('vGrow').textContent = growAmt<0.05?'quieto':growAmt<0.5?'suave':'intenso'; });
-  $('speed').addEventListener('input', e=>{ speed = e.target.value/100*1.8; $('vSpeed').textContent = (speed/0.6).toFixed(1)+'×'; });
-  $('detail').addEventListener('input', e=>{ detail = e.target.value/100; $('vDetail').textContent = detail<0.34?'baja':detail<0.67?'media':'alta'; });
-  $('hue').addEventListener('input', e=>{ hue = e.target.value/100*6.283; const names=['fuego','ámbar','verdor','turquesa','violeta','magenta']; $('vHue').textContent = names[Math.floor(e.target.value/100*5.99)]; });
+  $('grow').addEventListener('input', e=>{ growAmt=e.target.value/100; $('vGrow').textContent = growAmt<0.05?'quieto':growAmt<0.5?'suave':'intenso'; });
+  $('speed').addEventListener('input', e=>{ speed=e.target.value/100*1.8; $('vSpeed').textContent=(speed/0.6).toFixed(1)+'×'; });
+  $('detail').addEventListener('input', e=>{ detail=e.target.value/100; material.uniforms.uDetail.value=detail; $('vDetail').textContent = detail<0.34?'baja':detail<0.67?'media':'alta'; });
+  $('hue').addEventListener('input', e=>{ hue=e.target.value/100*6.283; const names=['fuego','ámbar','verdor','turquesa','violeta','magenta']; $('vHue').textContent=names[Math.floor(e.target.value/100*5.99)]; });
 
   const autoBtn=$('autoBtn'), pauseBtn=$('pauseBtn');
-  autoBtn.addEventListener('click', ()=>{ autoTravel=!autoTravel; setAuto(); });
-  pauseBtn.addEventListener('click', ()=>{ paused=!paused; pauseBtn.textContent = paused?'Reanudar':'Pausar'; pauseBtn.classList.toggle('active', paused); });
-  function setAuto(){ autoBtn.classList.toggle('active', autoTravel); autoBtn.textContent = autoTravel?'Auto-viaje':'Manual'; }
+  autoBtn.addEventListener('click', ()=>{ autoTravel=!autoTravel; syncAuto(); });
+  pauseBtn.addEventListener('click', ()=>{ paused=!paused; pauseBtn.textContent=paused?'Reanudar':'Pausar'; pauseBtn.classList.toggle('active', paused); });
+}
+function syncAuto(){ const b=document.getElementById('autoBtn'); b.classList.toggle('active', autoTravel); b.textContent = autoTravel?'Auto-viaje':'Manual'; }
 
-  let hintHidden=false;
-  function hideHint(){ if(hintHidden) return; hintHidden=true; const h=$('hint'); h.style.opacity='0'; setTimeout(()=>h.remove(),700); }
-  setTimeout(hideHint, 6000);
+function onResize(){
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+}
 
-  // --- resize ---
-  function resize(){
-    const dpr = Math.min(window.devicePixelRatio||1, 1.5);
-    canvas.width  = Math.floor(innerWidth*dpr);
-    canvas.height = Math.floor(innerHeight*dpr);
-  }
-  window.addEventListener('resize', resize);
-  resize();
+function render(){
+  const dt = Math.min(clock.getDelta(), 0.05);
+  if(!paused) simTime += dt;
 
-  // matriz de rotación de cámara a partir de yaw/pitch
-  function camRotation(yaw, pitch){
-    const cy=Math.cos(yaw), sy=Math.sin(yaw), cp=Math.cos(pitch), sp=Math.sin(pitch);
-    // columnas: right, up, forward
-    const right = [cy, 0, -sy];
-    const up    = [sy*sp, cp, cy*sp];
-    const fwd   = [sy*cp, -sp, cy*cp];
-    // mat3 column-major para WebGL
-    return new Float32Array([
-      right[0], right[1], right[2],
-      up[0],    up[1],    up[2],
-      fwd[0],   fwd[1],   fwd[2]
-    ]);
+  // Auto-viaje: nos sumergimos y emergemos del fractal en bucle.
+  if(autoTravel && !paused){
+    flyDist = 1.7 + 1.05*Math.sin(simTime*0.13*speed);
+    flyDist = Math.max(0.65, flyDist);
   }
 
-  let tPrev = performance.now();
-  let simTime = 0;
+  // Avance manual (escritorio).
+  const ks = dt*1.1*speed;
+  if(keyboard.has('KeyW')) flyDist = Math.max(0.45, flyDist - ks);
+  if(keyboard.has('KeyS')) flyDist = Math.min(6.0, flyDist + ks);
 
-  function frame(now){
-    const dt = Math.min((now - tPrev)/1000, 0.05);
-    tPrev = now;
-    if(!paused) simTime += dt;
-
-    // viaje automático: respira hacia dentro y hacia fuera, y orbita lento
-    if(autoTravel && !paused){
-      yaw += dt*0.08*speed;
-      pitch = Math.sin(simTime*0.18)*0.5;
-      dist = 1.55 + 1.15*Math.sin(simTime*0.13*speed) ; // se sumerge y emerge
-      dist = Math.max(0.7, dist);
+  // Avance en VR: gatillo apretado avanza, squeeze retrocede.
+  if(renderer.xr.isPresenting){
+    for(const c of controllers){
+      // Detectar gatillo mediante gamepad del controlador XR.
+      const src = c.userData.inputSource;
+      if(src && src.gamepad){
+        const trigger = src.gamepad.buttons[0]?.value || 0;
+        if(trigger > 0.1 && !autoTravel) flyDist = Math.max(0.45, flyDist - dt*1.6*speed*trigger);
+      }
+      if(c.userData.reverse) flyDist = Math.min(6.0, flyDist + dt*1.6*speed);
     }
-
-    // movimiento manual con teclado (avanza por dist)
-    const ks = dt*1.2*speed;
-    if(keys.has('KeyW')) dist = Math.max(0.55, dist - ks);
-    if(keys.has('KeyS')) dist = Math.min(6.0, dist + ks);
-    if(keys.has('KeyA')) yaw += ks*0.8;
-    if(keys.has('KeyD')) yaw -= ks*0.8;
-    if(keys.has('KeyQ')) pitch = Math.max(-1.5, pitch - ks*0.8);
-    if(keys.has('KeyE')) pitch = Math.min(1.5, pitch + ks*0.8);
-
-    // posición de cámara: sobre una esfera mirando al centro
-    const rot = camRotation(yaw, pitch);
-    // forward es la 3a columna; la cámara está a 'dist' en -forward del centro
-    const fwd = [rot[6], rot[7], rot[8]];
-    const camPos = [ fwd[0]*dist, fwd[1]*dist, fwd[2]*dist ];
-
-    // power animado: el fractal "crece" pulsando su exponente entre ~6 y ~9
-    const power = 8.0 + Math.sin(simTime*0.25)*1.5*growAmt + growAmt*0.0;
-
-    gl.viewport(0,0,canvas.width,canvas.height);
-    gl.uniform2f(U.uRes, canvas.width, canvas.height);
-    gl.uniform1f(U.uTime, simTime);
-    gl.uniform3f(U.uCamPos, camPos[0], camPos[1], camPos[2]);
-    gl.uniformMatrix3fv(U.uCamRot, false, rot);
-    gl.uniform1f(U.uPower, power);
-    gl.uniform1f(U.uDetail, detail);
-    gl.uniform1f(U.uHue, hue);
-    gl.uniform1f(U.uGrow, growAmt);
-
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-
-    // lectura de profundidad aproximada
-    const depthPct = Math.max(0, Math.min(100, (1 - (dist-0.55)/(6.0-0.55))*100));
-    $('depth').textContent = 'profundidad ' + depthPct.toFixed(0) + '%';
-
-    requestAnimationFrame(frame);
   }
-  requestAnimationFrame(frame);
-})();
+
+  // El "power" animado hace crecer/transformar el fractal.
+  const power = 8.0 + Math.sin(simTime*0.25)*1.5*growAmt;
+
+  material.uniforms.uTime.value  = simTime;
+  material.uniforms.uPower.value = power;
+  material.uniforms.uGrow.value  = growAmt;
+  material.uniforms.uFly.value   = flyDist;
+
+  // El domo sigue a la cámara para envolver siempre la vista (también en VR).
+  const camWorld = new THREE.Vector3();
+  camera.getWorldPosition(camWorld);
+  quad.position.copy(camWorld);
+  // El centro del fractal se mantiene a una distancia fija frente a la cámara base.
+  material.uniforms.uCenter.value.set(camWorld.x, camWorld.y, camWorld.z - 2.4);
+
+  if(!renderer.xr.isPresenting) controls.update();
+
+  renderer.render(scene, camera);
+
+  const depthPct = Math.max(0, Math.min(100, (1 - (flyDist-0.45)/(6.0-0.45))*100));
+  const d = document.getElementById('depth');
+  if(d) d.textContent = 'profundidad ' + depthPct.toFixed(0) + '%';
+}
+
+// Capturar la fuente de entrada de cada controlador para leer el gatillo.
+renderer.xr.addEventListener('sessionstart', ()=>{
+  const s = renderer.xr.getSession();
+  if(!s) return;
+  const assign = ()=>{
+    const sources = s.inputSources;
+    for(let i=0;i<controllers.length;i++){
+      controllers[i].userData.inputSource = sources[i];
+    }
+  };
+  s.addEventListener('inputsourceschange', assign);
+  assign();
+});
 </script>
 </body>
 </html>
