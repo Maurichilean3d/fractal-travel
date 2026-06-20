@@ -103,7 +103,7 @@
 
   <div id="keys">
     <b>Escritorio:</b> arrastra para mirar · rueda y W/S avanzan<br>
-    <b>VR:</b> gatillo = avanzar · squeeze = retroceder
+    <b>VR:</b> stick = desplazarse · gatillo = acercar · squeeze = alejar
   </div>
 </div>
 
@@ -128,6 +128,13 @@ const TRAVEL_MIN = 1.05, TRAVEL_MAX = 7.0;
 
 const keyboard = new Set();
 const controllers = [];
+const rigOffset = new THREE.Vector3();
+const WORLD_UP = new THREE.Vector3(0, 1, 0);
+const tmpForward = new THREE.Vector3();
+const tmpRight = new THREE.Vector3();
+const tmpMove = new THREE.Vector3();
+const tmpCamWorld = new THREE.Vector3();
+let stickWasMoving = false;
 
 // --- resolución adaptativa ---
 let curRatio = 1.2;
@@ -421,6 +428,7 @@ function init(){
     // Al entrar a VR, limpiamos cualquier rotación de OrbitControls en el rig.
     // La orientación de la cabeza la debe manejar el visor.
     camRig.quaternion.identity();
+    rigOffset.set(0, 0, 0);
     positionRig();
     // En VR recortar el FOV produce efecto túnel; lo desactivamos por defecto.
     material.uniforms.uConeOn.value = 0;
@@ -453,7 +461,90 @@ function init(){
 // solo movemos el rig en el espacio, así el objeto se queda fijo.
 function positionRig(){
   if(!camRig) return;
-  camRig.position.set(FRACTAL_CENTER.x, FRACTAL_CENTER.y, FRACTAL_CENTER.z + travelDist);
+  camRig.position.set(
+    FRACTAL_CENTER.x + rigOffset.x,
+    FRACTAL_CENTER.y + rigOffset.y,
+    FRACTAL_CENTER.z + travelDist + rigOffset.z
+  );
+}
+
+function applyDeadzone(v, dead=0.13){
+  const a = Math.abs(v);
+  if(a < dead) return 0;
+  return Math.sign(v) * (a - dead) / (1 - dead);
+}
+
+function getStickAxes(gamepad){
+  if(!gamepad || !gamepad.axes || gamepad.axes.length < 2) return null;
+  const axes = gamepad.axes;
+
+  // En muchos controles WebXR el stick/touchpad viene en axes[2]/axes[3].
+  // En otros viene en axes[0]/axes[1]. Probamos ambos y elegimos el par activo.
+  let x = axes[2] || 0, y = axes[3] || 0;
+  if(Math.abs(x) < 0.08 && Math.abs(y) < 0.08){
+    x = axes[0] || 0;
+    y = axes[1] || 0;
+  }
+
+  x = applyDeadzone(x);
+  y = applyDeadzone(y);
+  if(x === 0 && y === 0) return null;
+  return { x, y };
+}
+
+function clampRigOffset(){
+  // Mantiene al usuario dentro de una zona cómoda alrededor del fractal.
+  // La posición real respecto al centro en el plano XZ es: offset lateral + distancia base.
+  const relX = rigOffset.x;
+  const relZ = travelDist + rigOffset.z;
+  const len = Math.hypot(relX, relZ);
+  if(len < 0.0001) return;
+
+  const clamped = THREE.MathUtils.clamp(len, TRAVEL_MIN, TRAVEL_MAX);
+  if(Math.abs(clamped - len) > 0.0001){
+    const k = clamped / len;
+    rigOffset.x = relX * k;
+    rigOffset.z = relZ * k - travelDist;
+  }
+}
+
+function updateStickLocomotion(dt){
+  if(!renderer.xr.isPresenting || paused) return;
+
+  tmpMove.set(0, 0, 0);
+  for(const c of controllers){
+    const gp = c.userData.inputSource?.gamepad;
+    const stick = getStickAxes(gp);
+    if(!stick) continue;
+
+    // Dirección basada en la mirada, pero bloqueada al plano horizontal
+    // para evitar subir/bajar al inclinar la cabeza.
+    camera.getWorldDirection(tmpForward);
+    tmpForward.y = 0;
+    if(tmpForward.lengthSq() < 0.0001) tmpForward.set(0, 0, -1);
+    tmpForward.normalize();
+    tmpRight.crossVectors(tmpForward, WORLD_UP).normalize();
+
+    tmpMove.addScaledVector(tmpRight, stick.x);
+    tmpMove.addScaledVector(tmpForward, -stick.y);
+  }
+
+  const len = tmpMove.length();
+  if(len <= 0.0001){
+    stickWasMoving = false;
+    return;
+  }
+
+  tmpMove.normalize().multiplyScalar(Math.min(len, 1));
+  const moveSpeed = 0.85 + speed * 1.35;
+  rigOffset.addScaledVector(tmpMove, dt * moveSpeed);
+  clampRigOffset();
+
+  if(!stickWasMoving){
+    autoTravel = false;
+    syncAuto();
+  }
+  stickWasMoving = true;
 }
 
 function setupControllers(){
@@ -544,22 +635,18 @@ function render(){
       }
       if(c.userData.reverse) travelDist = Math.min(TRAVEL_MAX, travelDist + dt*1.8*speed);
     }
+    updateStickLocomotion(dt);
   }
 
   material.uniforms.uTime.value = simTime;
   material.uniforms.uPower.value = 8.0 + Math.sin(simTime*0.25)*1.5*growAmt;
 
-  // La escala del fractal en el shader crece al acercarte -> más detalle visible.
-  // (distancia pequeña => uFly pequeño => el fractal "ocupa" más campo).
-  const uFly = THREE.MathUtils.clamp(travelDist*0.42, 0.4, 3.2);
-  material.uniforms.uFly.value = uFly;
-
   // El fractal está FIJO: el uniform uCenter no cambia con la mirada.
   // (se quedó en FRACTAL_CENTER desde init).
 
   if(renderer.xr.isPresenting){
-    // En VR movemos el rig acercándolo/alejándolo del fractal en su eje,
-    // sin tocar la orientación de la cámara (la controla el visor).
+    // En VR movemos el rig completo: gatillo/squeeze ajustan distancia y
+    // el stick desplaza lateral/adelante según la dirección de la cabeza.
     positionRig();
   } else {
     // En escritorio, OrbitControls orbita la cámara alrededor del fractal fijo.
@@ -567,11 +654,17 @@ function render(){
     controls.update();
   }
 
+  camera.getWorldPosition(tmpCamWorld);
+
+  // La escala del fractal en el shader crece al acercarte -> más detalle visible.
+  // Con stick VR usamos la distancia real de la cámara al fractal, no solo travelDist.
+  const camDist = tmpCamWorld.distanceTo(FRACTAL_CENTER);
+  const uFly = THREE.MathUtils.clamp(camDist*0.42, 0.4, 3.2);
+  material.uniforms.uFly.value = uFly;
+
   // Eje del cono = dirección de la cámara HACIA el fractal (enmarca el objeto,
   // no la cabeza). Así girar la vista no arrastra el recorte de forma rara.
-  const camWorld = new THREE.Vector3();
-  camera.getWorldPosition(camWorld);
-  material.uniforms.uForward.value.copy(FRACTAL_CENTER).sub(camWorld).normalize();
+  material.uniforms.uForward.value.copy(FRACTAL_CENTER).sub(tmpCamWorld).normalize();
 
   updateAdaptiveRes(dt);
   renderer.render(scene, camera);
@@ -583,4 +676,3 @@ function render(){
 </script>
 </body>
 </html>
-    
